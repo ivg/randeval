@@ -49,7 +49,8 @@ module Interpreter(Ctxt : Ctxt) = struct
       exp m >>= fun _ ->
       exp a >>= fun a ->
       Seq.range 0 (Size.in_bytes sz) |>
-      Ctxt.Seq.map ~f:(fun off -> Ctxt.load (Addr.nsucc a off)) >>|
+      Ctxt.Seq.map ~f:(fun off ->
+          Ctxt.load (Addr.nsucc a off)) >>|
       Seq.reduce_exn ~f:(fun x y -> match ed with
           | BigEndian -> Word.concat x y
           | LittleEndian -> Word.concat y x)
@@ -109,6 +110,10 @@ module Ctxt = struct
 
   let cast m x = Word.extract_exn ~hi:(m-1) x
 
+  let pp_ref ppf = function
+    | Reg v -> Format.fprintf ppf "%a" Var.pp v
+    | Ptr p -> Format.fprintf ppf "%a" Addr.pp p
+
   let deref m v =
     Ctxt.get () >>= fun s ->
     match Map.find s.ctxt v with
@@ -127,6 +132,7 @@ module Ctxt = struct
   let read v = match Var.typ v with
     | Type.Imm m -> deref m (Reg v)
     | _ -> Ctxt.return Word.b0
+
   let load x = deref 8 (Ptr x)
 
   let saved v x = Ctxt.update @@ fun s -> {
@@ -177,9 +183,6 @@ module Ctxt = struct
     space;
   }
 
-  let pp_ref ppf = function
-    | Reg v -> Format.fprintf ppf "%a" Var.pp v
-    | Ptr p -> Format.fprintf ppf "%a" Addr.pp p
 
   let pp_inputs ppf state =
     Format.pp_print_list
@@ -208,8 +211,9 @@ end
 
 module Interperter = Interpreter(Ctxt)
 
-let states space bil =
+let states ?(verbose=false) space bil =
   let space = Set.of_list (module Word) space in
+  if verbose then Format.printf "%a@\n" Bil.pp bil;
   let run ctxt = snd @@ Ctxt.run (Interperter.eval bil) ctxt in
   Seq.unfold ~init:(Some (Ctxt.empty space)) ~f:(function
       | None -> None
@@ -220,13 +224,13 @@ let states space bil =
 module Dis = Disasm_expert
 
 let space = [
-  Word.zero 128;
-  Word.ones 128;
-  Word.one 128;
-  Word.of_int64 ~width:128 0xDEADBEEFL;
+  Word.zero 64;
+  Word.ones 64;
+  Word.one 64;
+  Word.of_int64 0xAAAAAAAAAAAAAAAAL;
 ]
 
-let run arch bytes =
+let run ?verbose arch bytes =
   let bytes = Bigstring.of_string bytes in
   let endian = Arch.endian arch in
   let width = Size.in_bits (Arch.addr_size arch) in
@@ -234,17 +238,13 @@ let run arch bytes =
   let mem = ok_exn (Memory.create endian entry bytes) in
   Disasm_expert.Linear.With_exn.sweep arch mem |>
   List.concat_map ~f:(function
-      |  (_, Some insn) ->
-        let bil = Insn.bil insn in
-        Format.printf "%a@\n" Bil.pp bil;
-        bil
-
+      |  (_, Some insn) -> Insn.bil insn
       | _ -> []) |>
-  states space
+  states ?verbose space
 
-let print_state () =
+let print_state ?verbose arch =
   Array.iter (Array.subo ~pos:2 Sys.argv) ~f:(fun input ->
-      run `x86_64 (Scanf.unescaped input) |>
+      run ?verbose arch (Scanf.unescaped input) |>
       Seq.iteri ~f:(fun i {Ctxt.ctxt; state} ->
           Format.printf "State %d: [%a]@\n" i Ctxt.pp_inputs state;
           Map.iteri ctxt ~f:(fun ~key ~data ->
@@ -252,38 +252,66 @@ let print_state () =
                 Ctxt.pp_ref key
                 Word.pp data)))
 
-let diff_states () =
-  let base = run `x86_64 (Scanf.unescaped Sys.argv.(2)) in
-  Array.iter (Array.subo ~pos:2 Sys.argv) ~f:(fun input ->
-      let test = run `x86_64 (Scanf.unescaped input) in
-      Seq.zip base test |>
-      Seq.iteri ~f:(fun i (base,test) ->
-          let diff = Ctxt.diff base test in
-          if Ctxt.differs diff then begin
-            Format.printf "State %d differs:\n" i;
-            Seq.iter diff ~f:(fun (k,d) -> match d with
-                | `Left x ->
-                  Format.printf "  < %a = %a@\n"
-                    Ctxt.pp_ref k Word.pp x
-                | `Right x ->
-                  Format.printf "  > %a = %a@\n"
-                    Ctxt.pp_ref k Word.pp x
-                | `Unequal (x,y) ->
-                  Format.printf "  | %a = %a <> %a"
-                    Ctxt.pp_ref k Word.pp x Word.pp y)
-          end else
-            Format.printf "State %d matches!\n%!" i))
+let pp_diff ppf diff =
+  Seq.iter diff ~f:(fun (k,d) -> match d with
+      | `Left x ->
+        Format.fprintf ppf "  < %a = %a@\n"
+          Ctxt.pp_ref k Word.pp x
+      | `Right x ->
+        Format.fprintf ppf "  > %a = %a@\n"
+          Ctxt.pp_ref k Word.pp x
+      | `Unequal (x,y) ->
+        Format.fprintf ppf "  | %a = %a <> %a\n"
+          Ctxt.pp_ref k Word.pp x Word.pp y)
+
+let print_diffs input states =
+  Seq.iteri states ~f:(fun i (base,test) ->
+      let diff = Ctxt.diff base test in
+      if Ctxt.differs diff
+      then Format.printf "State %d differs:@\n%a@\n%!" i pp_diff diff
+      else Format.printf "State %d matches!\n%!" i)
+
+let find_diff input states =
+  Seq.exists states ~f:(fun (base,test) ->
+      Ctxt.differs (Ctxt.diff base test)) |> function
+  | false ->
+    Format.printf "%s: MATCHES@\n%!" input;
+  | true ->
+    Format.printf "%s: DIFFERS@\n%!" input
+
+let check_states ?verbose check arch =
+  let base = Seq.memoize @@
+    run ?verbose arch (Scanf.unescaped Sys.argv.(2)) in
+  Array.iter (Array.subo ~pos:3 Sys.argv) ~f:(fun input ->
+      let test = run ?verbose arch (Scanf.unescaped input) in
+      check input (Seq.zip base test))
 
 let print_help () =
-  Format.eprintf "Usage: ./randeval {eval|diff} bytes...\n%!"
+  Format.eprintf {|
+Usage: ./randeval {eval|diff|comp} bytes bytes...\n%! \
+    Instructions are specified using escaped byte sequences, e.g,
+    $ ./randeval eval "\x48\x3b\x47\x30\x48"
 
+    Command:
+    - eval - evaluate each sequence and print resulting environments;
+    - diff - diff the first instruction with the rest instructios;
+    - comp - compare the first with other, but don't print the diff.
 
-let () = Plugins.run ()
+    Example:
 
+    $ randeval comp "x48\x3b\x47\x30" \
+          "\x48\x3b\x47\x30\x48\x8b\x47\x28" \
+          "\x48\x3b\x47\x30\x48\x8b\x47\x28" \
+          "\x48\x8b\x47\x28\x48\x3b\x47\x30" \
+          "x48\x3b\x47\x30"
+|}
 
 let () =
+  Plugins.run ();
+  let arch = `x86_64 in
   if Array.length Sys.argv < 3 then print_help ()
   else match Sys.argv.(1) with
-    | "eval" -> print_state ()
-    | "diff" -> diff_states ()
+    | "eval" -> print_state ~verbose:true arch
+    | "diff" -> check_states ~verbose:true print_diffs arch
+    | "comp" -> check_states find_diff arch
     | _ -> print_help ()
