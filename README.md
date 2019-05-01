@@ -82,13 +82,11 @@ State 3 matches!
 ## The `comp` command
 
 This command is similar to `diff`, except that instead of printing the
-results of comparison of each state, it will find the first
+results of comparison of each state, it will search for the first
 mismatching step and print `DIFFERS` if one is found, or `MATCHES`
-otherwise. E.g.,
+otherwise, and will stop afterwards. E.g.,
 ```
-./randeval.native comp "\x48\x8d\x74\x24\x30" \
-                       "\x48\x8d\x74\x30\x24" \
-                       "\x48\x8d\x74\x24\x30"
-\x48\x8d\x74\x30\x24: DIFFERS
-\x48\x8d\x74\x24\x30: MATCHES
+randeval.native comp "\x48\x8d\x3b" "\x48\x89\xdf" "\x48\x8b\x3b"
+\x48\x89\xdf: MATCHES
+\x48\x8b\x3b: DIFFERS
 ```
