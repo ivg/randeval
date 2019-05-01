@@ -26,7 +26,7 @@ module Interpreter(Ctxt : Ctxt) = struct
       method! map_var v' =
         if Var.equal v v' then r else (Var v')
       method! map_let v' ~exp:x ~body:y =
-        if Var.equal v v' then Let(v',x,y)
+        if Var.equal v v' then Let(v',self#map_exp x,y)
         else Let(v',self#map_exp x, self#map_exp y)
     end)#map_exp
 
@@ -121,6 +121,7 @@ module Ctxt = struct
     | None -> match Map.find s.input v with
       | Some p -> Ctxt.return @@ Map.find_exn s.state p
       | None ->
+        Format.printf "Input: %a@\n" pp_ref v;
         let r = cast m (Set.min_elt_exn s.space) in
         let p = Map.length s.input in
         let input = Map.add_exn s.input v p in
