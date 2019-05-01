@@ -169,12 +169,11 @@ module Ctxt = struct
   let differs diff = not (Seq.is_empty diff)
 
   let next_state states x =
-    let x = Word.succ x in
-    match Seq.hd @@ Set.to_sequence ~greater_or_equal_to:x states with
-    | None ->
-      Set.min_elt_exn states
-    | Some r ->
-      Word.extract_exn ~hi:(Word.bitwidth x - 1) r
+    let m = Word.bitwidth x in
+    Set.to_sequence states |> Seq.find ~f:(fun r ->
+        Word.(cast m r > x)) |> function
+    | None -> cast m (Set.min_elt_exn states)
+    | Some r -> cast m r
 
   let empty space = {
     ctxt  = Map.empty (module Ref);
@@ -225,9 +224,9 @@ module Dis = Disasm_expert
 
 let space = [
   Word.zero 64;
-  Word.ones 64;
   Word.one 64;
-  Word.of_int64 0xAAAAAAAAAAAAAAAAL;
+  Word.of_int64 0xAAAAAAAA_AAAAAAAAL;
+  Word.ones 64;
 ]
 
 let run ?verbose arch bytes =
