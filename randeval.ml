@@ -100,8 +100,8 @@ module Ctxt = struct
 
   type state = {
     ctxt : word Map.M(Ref).t;
-    input : int Map.M(Ref).t;
-    state : word Map.M(Int).t;
+    input : Ref.t list;
+    state : word Map.M(Ref).t;
     space : Word.Set.t;
   }
 
@@ -118,16 +118,14 @@ module Ctxt = struct
     Ctxt.get () >>= fun s ->
     match Map.find s.ctxt v with
     | Some r -> Ctxt.return r
-    | None -> match Map.find s.input v with
-      | Some p -> Ctxt.return @@ Map.find_exn s.state p
+    | None -> match Map.find s.state v with
+      | Some r -> Ctxt.return r
       | None ->
         let r = cast m (Set.min_elt_exn s.space) in
-        let p = Map.length s.input in
-        let input = Map.add_exn s.input v p in
-        let state = Map.add_exn s.state p r in
+        let input = v :: s.input in
+        let state = Map.add_exn s.state v r in
         Ctxt.put {s with state; input} >>| fun () ->
         r
-
 
   let read v = match Var.typ v with
     | Type.Imm m -> deref m (Reg v)
@@ -175,33 +173,39 @@ module Ctxt = struct
     | None -> cast m (Set.min_elt_exn states)
     | Some r -> cast m r
 
-  let empty space = {
-    ctxt  = Map.empty (module Ref);
-    input = Map.empty (module Ref);
-    state = Map.empty (module Int);
-    space;
-  }
+  let init input space =
+    let init = Set.min_elt_exn space in
+    let state =
+      List.fold input ~init:(Map.empty (module Ref)) ~f:(fun s v ->
+          Map.add_exn s v init) in
+    {
+      ctxt  = Map.empty (module Ref);
+      input;
+      state;
+      space;
+    }
 
 
   let pp_inputs ppf state =
-    Format.pp_print_list
-      ~pp_sep:(fun ppf () -> Format.pp_print_string ppf ", ")
-      Word.pp ppf
-      (Map.data state)
+    let pp_sep ppf () = Format.pp_print_string ppf "; " in
+    let pp_elt ppf (v,x) =
+      Format.fprintf ppf "%a = %a" pp_ref v Word.pp x in
+    Format.pp_print_list ~pp_sep pp_elt ppf (Map.to_alist state)
 
   let succ s =
-    let state = Map.empty (module Int) in
-    Map.to_sequence s.state |>
-    Seq.fold ~init:(state,true) ~f:(fun (word,incr) (p,x) ->
+    let state = Map.empty (module Ref) in
+    List.fold s.input ~init:(state,true) ~f:(fun (word,incr) v ->
+        let x = Map.find_exn s.state v in
         if incr then
           let next = next_state s.space x in
-          (Map.set word p next, Word.(next <= x))
-        else (Map.set word p x,false)) |> function
+          (Map.set word v next, Word.(next <= x))
+        else (Map.set word v x,false)) |> function
     | (_,true) -> None
     | (state,false) -> Some {
-        (empty s.space)
+        s
         with state;
-             input = s.input
+             input = s.input;
+             ctxt = Map.empty (module Ref);
       }
 
   include Monad.State.T1(struct type t = state end)(Monad.Ident)
@@ -210,11 +214,12 @@ end
 
 module Interperter = Interpreter(Ctxt)
 
-let states ?(verbose=false) space bil =
+let states ?(verbose=false) ?(input=[]) space bil =
   let space = Set.of_list (module Word) space in
   if verbose then Format.printf "%a@\n" Bil.pp bil;
+  let init = Some (Ctxt.init input space) in
   let run ctxt = snd @@ Ctxt.run (Interperter.eval bil) ctxt in
-  Seq.unfold ~init:(Some (Ctxt.empty space)) ~f:(function
+  Seq.unfold ~init ~f:(function
       | None -> None
       | Some ctxt ->
         let ctxt = run ctxt in
@@ -229,7 +234,7 @@ let space = [
   Word.ones 64;
 ]
 
-let run ?verbose arch bytes =
+let lift arch bytes =
   let bytes = Bigstring.of_string bytes in
   let endian = Arch.endian arch in
   let width = Size.in_bits (Arch.addr_size arch) in
@@ -238,8 +243,11 @@ let run ?verbose arch bytes =
   Disasm_expert.Linear.With_exn.sweep arch mem |>
   List.concat_map ~f:(function
       |  (_, Some insn) -> Insn.bil insn
-      | _ -> []) |>
-  states ?verbose space
+      | _ -> [])
+
+
+let run ?verbose arch bytes =
+  states ?verbose space (lift arch bytes)
 
 let print_state ?verbose arch =
   Array.iter (Array.subo ~pos:2 Sys.argv) ~f:(fun input ->
@@ -264,26 +272,42 @@ let pp_diff ppf diff =
           Ctxt.pp_ref k Word.pp x Word.pp y)
 
 let print_diffs input states =
-  Seq.iteri states ~f:(fun i (base,test) ->
-      let diff = Ctxt.diff base test in
-      if Ctxt.differs diff
-      then Format.printf "State %d differs:@\n%a@\n%!" i pp_diff diff
-      else Format.printf "State %d matches!\n%!" i)
+  Seq.iteri states ~f:(fun i -> function
+      | `Both (base,test) ->
+        let diff = Ctxt.diff base test in
+        if Ctxt.differs diff
+        then Format.printf "State %d differs:@\n%a@\n%!" i pp_diff diff
+        else Format.printf "State %d matches!\n%!" i
+      | `Left _ ->
+        Format.printf "State %d is present only in base@\n%!" i
+      | `Right _ ->
+        Format.printf "State %d is present only in other@\n%!" i)
 
 let find_diff input states =
-  Seq.exists states ~f:(fun (base,test) ->
-      Ctxt.differs (Ctxt.diff base test)) |> function
+  Seq.exists states ~f:(function
+      | `Left _ | `Right _ -> true
+      | `Both (base,test) ->
+        Ctxt.differs (Ctxt.diff base test)) |> function
   | false ->
     Format.printf "%s: MATCHES@\n%!" input;
   | true ->
     Format.printf "%s: DIFFERS@\n%!" input
 
 let check_states ?verbose check arch =
-  let base = Seq.memoize @@
-    run ?verbose arch (Scanf.unescaped Sys.argv.(2)) in
-  Array.iter (Array.subo ~pos:3 Sys.argv) ~f:(fun input ->
-      let test = run ?verbose arch (Scanf.unescaped input) in
-      check input (Seq.zip base test))
+  let bils =
+    List.rev @@
+    Array.foldi Sys.argv ~init:[] ~f:(fun i bils data ->
+        if i = 0 || i = 1 then bils
+        else (data,lift arch (Scanf.unescaped data)) :: bils) in
+  let input =
+    List.fold bils ~init:(Set.empty (module Var)) ~f:(fun fv (_,bil) ->
+        Set.union fv (Bil.free_vars bil)) |>
+    Set.to_list |> List.map ~f:(fun v -> Ctxt.Reg v) in
+  let (_,base),rest = List.hd_exn bils, List.tl_exn bils in
+  let base = Seq.memoize @@ states ?verbose ~input space base in
+  List.iter rest ~f:(fun (data,bil) ->
+      let test = states ?verbose ~input space bil in
+      check data (Seq.zip_full base test))
 
 let print_help () =
   Format.eprintf {|
