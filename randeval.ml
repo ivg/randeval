@@ -114,24 +114,39 @@ module Ctxt = struct
     | Reg v -> Format.fprintf ppf "%a" Var.pp v
     | Ptr p -> Format.fprintf ppf "%a" Addr.pp p
 
-  let deref m v =
-    Ctxt.get () >>= fun s ->
-    match Map.find s.ctxt v with
+  let mem = Reg (Var.create "mem" bool_t)
+
+  let mixbyte ~addr ~seed =
+    let a = Word.of_int64 6364136223846793005L in
+    let c = Word.of_int64 1442695040888963407L in
+    Word.(extract_exn ~hi:7 (addr lxor (a * seed + c)))
+
+  let seed s m v = match Map.find s.state v with
     | Some r -> Ctxt.return r
-    | None -> match Map.find s.state v with
-      | Some r -> Ctxt.return r
-      | None ->
-        let r = cast m (Set.min_elt_exn s.space) in
-        let input = v :: s.input in
-        let state = Map.add_exn s.state v r in
-        Ctxt.put {s with state; input} >>| fun () ->
-        r
+    | None ->
+      let r = cast m (Set.min_elt_exn s.space) in
+      let input = v :: s.input in
+      let state = Map.add_exn s.state v r in
+      Ctxt.put {s with state; input} >>| fun () ->
+      r
+
+  let load addr =
+    Ctxt.get () >>= fun s ->
+    match Map.find s.ctxt (Ptr addr) with
+    | Some r -> Ctxt.return r
+    | None ->
+      seed s (Word.bitwidth addr) mem >>| fun seed ->
+      mixbyte ~addr ~seed
+
+  let read_imm m v =
+    Ctxt.get () >>= fun s ->
+    match Map.find s.ctxt (Reg v) with
+    | Some r -> Ctxt.return r
+    | None -> seed s m (Reg v)
 
   let read v = match Var.typ v with
-    | Type.Imm m -> deref m (Reg v)
+    | Type.Imm m -> read_imm m v
     | _ -> Ctxt.return Word.b0
-
-  let load x = deref 8 (Ptr x)
 
   let saved v x = Ctxt.update @@ fun s -> {
       s with ctxt = Map.set s.ctxt (Reg v) x
