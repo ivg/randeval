@@ -121,7 +121,6 @@ module Ctxt = struct
     | None -> match Map.find s.input v with
       | Some p -> Ctxt.return @@ Map.find_exn s.state p
       | None ->
-        Format.printf "Input: %a@\n" pp_ref v;
         let r = cast m (Set.min_elt_exn s.space) in
         let p = Map.length s.input in
         let input = Map.add_exn s.input v p in
@@ -305,6 +304,8 @@ Usage: ./randeval {eval|diff|comp} bytes bytes...\n%! \
           "\x48\x8b\x47\x28\x48\x3b\x47\x30" \
           "x48\x3b\x47\x30"
 |}
+
+
 
 let () =
   Plugins.run ();
