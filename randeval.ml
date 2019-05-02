@@ -85,6 +85,14 @@ module Interpreter(Ctxt : Ctxt) = struct
       Word.concat x y
 end
 
+let repeat m x =
+  let w = Word.bitwidth x in
+  let rec cat m =
+    if m <= w then Word.extract_exn ~hi:(m-1) x
+    else Word.concat x (cat (m-w)) in
+  cat m
+
+
 module Ctxt = struct
   type ref =
     | Reg of var
@@ -117,12 +125,14 @@ module Ctxt = struct
   let mem = Reg (Var.create "mem" bool_t)
 
   let mixbyte ~addr ~seed =
-    let a = Word.of_int64 6364136223846793005L in
-    let c = Word.of_int64 1442695040888963407L in
-    Word.(extract_exn ~hi:7 (addr lxor (a * seed + c)))
+    let w = Addr.bitwidth addr in
+    let a = Word.of_int64 ~width:w 6364136223846793005L in
+    let c = Word.of_int64 ~width:w 1442695040888963407L in
+    let s = repeat w seed in
+    Word.(extract_exn ~hi:7 (a * s * (c + addr)))
 
   let seed s m v = match Map.find s.state v with
-    | Some r -> Ctxt.return r
+    | Some r -> Ctxt.return (cast m r)
     | None ->
       let r = cast m (Set.min_elt_exn s.space) in
       let input = v :: s.input in
@@ -148,9 +158,11 @@ module Ctxt = struct
     | Type.Imm m -> read_imm m v
     | _ -> Ctxt.return Word.b0
 
-  let saved v x = Ctxt.update @@ fun s -> {
-      s with ctxt = Map.set s.ctxt (Reg v) x
-    }
+  let saved v x = match Var.typ v with
+    | Mem _ -> Ctxt.return ()
+    | _ -> Ctxt.update @@ fun s -> {
+        s with ctxt = Map.set s.ctxt (Reg v) x
+      }
 
   let stored a x = Ctxt.update @@ fun s -> {
       s with ctxt = Map.set s.ctxt (Ptr a) x
@@ -229,9 +241,8 @@ end
 
 module Interperter = Interpreter(Ctxt)
 
-let states ?(verbose=false) ?(input=[]) space bil =
+let states ?(input=[]) space bil =
   let space = Set.of_list (module Word) space in
-  if verbose then Format.printf "%a@\n" Bil.pp bil;
   let init = Some (Ctxt.init input space) in
   let run ctxt = snd @@ Ctxt.run (Interperter.eval bil) ctxt in
   Seq.unfold ~init ~f:(function
@@ -243,30 +254,50 @@ let states ?(verbose=false) ?(input=[]) space bil =
 module Dis = Disasm_expert
 
 let space = [
-  Word.zero 64;
-  Word.one 64;
-  Word.of_int64 0xAAAAAAAA_AAAAAAAAL;
-  Word.ones 64;
+  Word.zero 8;
+  Word.one  8;
+  repeat 512 (Word.of_int ~width:8 0xAA);
+  Word.ones 512;
 ]
 
-let lift arch bytes =
-  let bytes = Bigstring.of_string bytes in
+let pp_mem ppf mem =
+  let mem = Format.asprintf "%a" Memory.pp mem in
+  Format.printf "%-40s" mem
+
+let print_asm entry bytes mem insn =
+  if Memory.min_addr mem = entry then
+    Format.printf "\"%s\"@\n" bytes;
+  Format.printf "%a ; %s@\n" pp_mem mem (Insn.asm insn)
+
+let lift ?(verbose=false) arch bytes =
+  let data = Bigstring.of_string (Scanf.unescaped bytes) in
   let endian = Arch.endian arch in
   let width = Size.in_bits (Arch.addr_size arch) in
   let entry = Addr.of_int 0x400000 ~width in
-  let mem = ok_exn (Memory.create endian entry bytes) in
-  Disasm_expert.Linear.With_exn.sweep arch mem |>
-  List.concat_map ~f:(function
-      |  (_, Some insn) -> Insn.bil insn
-      | _ -> [])
+  let mem = ok_exn (Memory.create endian entry data) in
+  let bil =
+    Disasm_expert.Linear.With_exn.sweep arch mem |>
+    List.concat_map ~f:(function
+        |  (mem, Some insn) ->
+          if verbose then print_asm entry bytes mem insn;
+          Insn.bil insn
+        | (mem,None) ->
+          let hlt =
+            let loc = Word.string_of_value (Memory.min_addr mem) in
+            Format.asprintf "HALT@%s" loc in
+          let bil = [Bil.special hlt] in
+          if verbose then Format.printf "%a ; <data>@\n" pp_mem mem;
+          bil) in
+  if verbose then Format.printf "%a@\n%!" Bil.pp bil;
+  bil
 
 
 let run ?verbose arch bytes =
-  states ?verbose space (lift arch bytes)
+  states space (lift ?verbose arch bytes)
 
 let print_state ?verbose arch =
   Array.iter (Array.subo ~pos:2 Sys.argv) ~f:(fun input ->
-      run ?verbose arch (Scanf.unescaped input) |>
+      run ?verbose arch input |>
       Seq.iteri ~f:(fun i {Ctxt.ctxt; state} ->
           Format.printf "State %d: [%a]@\n" i Ctxt.pp_inputs state;
           Map.iteri ctxt ~f:(fun ~key ~data ->
@@ -311,23 +342,25 @@ let find_diff input states =
 let check_states ?verbose check arch =
   let bils =
     List.rev @@
-    Array.foldi Sys.argv ~init:[] ~f:(fun i bils data ->
+    Array.foldi Sys.argv ~init:[] ~f:(fun i bils str ->
         if i = 0 || i = 1 then bils
-        else (data,lift arch (Scanf.unescaped data)) :: bils) in
+        else (str,lift ?verbose arch str)::bils) in
   let input =
     List.fold bils ~init:(Set.empty (module Var)) ~f:(fun fv (_,bil) ->
         Set.union fv (Bil.free_vars bil)) |>
     Set.to_list |> List.map ~f:(fun v -> Ctxt.Reg v) in
   let (_,base),rest = List.hd_exn bils, List.tl_exn bils in
-  let base = Seq.memoize @@ states ?verbose ~input space base in
+  let base = Seq.memoize @@ states ~input space base in
   List.iter rest ~f:(fun (data,bil) ->
-      let test = states ?verbose ~input space bil in
+      let test = states ~input space bil in
       check data (Seq.zip_full base test))
 
 let print_help () =
   Format.eprintf {|
 Usage: ./randeval {eval|diff|comp} bytes bytes...\n%! \
+
     Instructions are specified using escaped byte sequences, e.g,
+
     $ ./randeval eval "\x48\x3b\x47\x30\x48"
 
     Command:
@@ -337,11 +370,10 @@ Usage: ./randeval {eval|diff|comp} bytes bytes...\n%! \
 
     Example:
 
-    $ randeval comp "x48\x3b\x47\x30" \
-          "\x48\x3b\x47\x30\x48\x8b\x47\x28" \
-          "\x48\x3b\x47\x30\x48\x8b\x47\x28" \
-          "\x48\x8b\x47\x28\x48\x3b\x47\x30" \
-          "x48\x3b\x47\x30"
+    $ randeval comp "\x48\x3b\x47\x30\x48\x8b\x47\x28" \
+                    "\x48\x3b\x47\x30\x48\x8b\x47\x28" \
+                    "\x48\x8b\x47\x28\x48\x3b\x47\x30" \
+                    "x48\x3b\x47\x30"
 |}
 
 
